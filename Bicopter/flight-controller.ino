@@ -337,9 +337,9 @@ const int FIN_MAX = 1900;
 // PILOT CONTROL LIMITS
 // ============================================================
 
-const float MAX_ROLL_ANGLE = 35.0f;
+const float MAX_ROLL_ANGLE = 5.0f;
 const float MAX_PITCH_ANGLE = 25.0f;
-const float MAX_YAW_RATE = 100.0f;
+const float MAX_YAW_RATE = 50.0f;
 
 
 // ============================================================
@@ -362,7 +362,7 @@ struct PID {
 // ============================================================
 
 PID rollAnglePID = {
-  5.0f,
+  3.0f,
   0.0f,
   0,
   -400.0f,
@@ -375,11 +375,11 @@ PID rollAnglePID = {
 // ============================================================
 
 PID rollRatePID = {
-  1.0f,  // 1.5
+  1.0f,
   0.0f,
   0,
-  -400.0f,
-  400.0f
+  -200.0f,
+  200.0f
 };
 
 
@@ -388,7 +388,7 @@ PID rollRatePID = {
 // ============================================================
 
 PID pitchAnglePID = {
-  4.0f,
+  1.0f,
   0.0f,
   0,
   -80.0f,
@@ -401,7 +401,7 @@ PID pitchAnglePID = {
 // ============================================================
 
 PID pitchRatePID = {
-  1.5f,
+  1.0f,
   0.0f,
   0,
   -100.0f,
@@ -426,7 +426,7 @@ PID yawRatePID = {
 // D GAINS
 // ============================================================
 
-float rollD = 0.04f;
+float rollD = 0.02f;
 float pitchD = 0.02f;
 float yawD = 0.02f;
 
@@ -458,7 +458,7 @@ const float REAR_FIN_DIRECTION = -1.0f;
 // Leave zero until basic flight is working.
 //
 
-const float YAW_MOTOR_COMPENSATION = 0.02f;  // 0
+const float YAW_MOTOR_COMPENSATION = 0.0f;  // 0
 
 
 // ============================================================
@@ -641,12 +641,21 @@ void readMPU() {
 
 void calibrateGyro() {
   Serial.println();
-  Serial.println("======================================");
-  Serial.println("KEEP AIRCRAFT COMPLETELY STILL");
-  Serial.println("GYRO CALIBRATION");
-  Serial.println("======================================");
+  Serial.println(
+    "======================================");
+
+  Serial.println(
+    "KEEP AIRCRAFT COMPLETELY STILL");
+
+  Serial.println(
+    "GYRO CALIBRATION");
+
+  Serial.println(
+    "======================================");
+
 
   delay(1000);
+
 
   const int samples = 1000;
 
@@ -1841,7 +1850,7 @@ void loop() {
   // ==========================================================
 
   float desiredPitchAngle =
-    rcToAngle(
+    -rcToAngle(
       pitchUS,
       MAX_PITCH_ANGLE);
 
@@ -1859,7 +1868,7 @@ void loop() {
   // ==========================================================
 
   float desiredYawRate =
-    rcToRate(
+    -rcToRate(
       yawUS,
       MAX_YAW_RATE);
 
