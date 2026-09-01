@@ -393,7 +393,7 @@ const int TILT_MAX = 1900;
 // PILOT CONTROL LIMITS
 // ============================================================
 
-const float MAX_ROLL_ANGLE = 35.0f;
+const float MAX_ROLL_ANGLE = 15.0f;
 const float MAX_PITCH_ANGLE = 25.0f;
 const float MAX_YAW_RATE = 100.0f;
 
@@ -554,7 +554,7 @@ PID yawRatePID = {
 //
 
 const float ROLL_DIRECTION = -1.0f;
-const float PITCH_DIRECTION = 1.0f;
+const float PITCH_DIRECTION = -1.0f;
 const float YAW_DIRECTION = 1.0f;
 
 
@@ -2091,7 +2091,7 @@ void loop() {
   // ==========================================================
 
   float desiredYawRate =
-    rcToRate(
+    -rcToRate(
       yawUS,
       MAX_YAW_RATE);
 
