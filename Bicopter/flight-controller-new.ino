@@ -308,6 +308,24 @@ const float ACCEL_1G_LSB = 16384.0f;
 const float ACCEL_TRUST_LOW = 0.80f;
 const float ACCEL_TRUST_HIGH = 1.20f;
 
+
+// Magnitude alone is not enough. Lateral acceleration adds
+// in quadrature with gravity, so 0.2 g sideways gives
+//
+//     |a| = sqrt(1 + 0.04) = 1.02 g
+//
+// which sails through any sane magnitude band while tilting
+// the apparent horizon by atan(0.2) = 11 degrees. Catching
+// that by magnitude would need a +-2 percent window, which
+// sensor noise would trip constantly.
+//
+// So also reject the accelerometer when it disagrees with
+// the gyro-integrated angle. In honest flight the two track
+// within a couple of degrees; under lateral acceleration
+// they diverge by exactly the false-horizon error.
+
+const float ACCEL_DISAGREE_LIMIT = 12.0f;
+
 const float ACCEL_TRUST_LOW_SQ =
   (ACCEL_TRUST_LOW * ACCEL_1G_LSB)
   * (ACCEL_TRUST_LOW * ACCEL_1G_LSB);
@@ -322,6 +340,9 @@ const float ACCEL_TRUST_HIGH_SQ =
 // attitude estimate is coasting on gyro drift.
 
 bool accelTrusted = true;
+
+bool rollAccelOK = true;
+bool pitchAccelOK = true;
 
 
 // ============================================================
@@ -500,14 +521,73 @@ struct PID {
 //   dT/du               0.021 N per us
 //   tilt                90 deg per 1000 us, direct horn
 //
-//   I_pitch = I_yaw     0.073 kg m^2
-//   I_roll              0.0056 kg m^2
+// Moment of inertia (mass distribution, NOT the PID
+// integral term - unrelated quantity, unlucky letter):
+//
+//   pitch inertia       0.0721 kg m^2
+//   yaw inertia         0.0721 kg m^2
+//   roll inertia        0.0067 kg m^2
+//
+// Roll inertia is small because almost everything sits ON
+// the roll axis. Only two things are meaningfully off it -
+// the nacelles above, and the battery slung below:
+//
+//   2 x 0.225 kg at 0.089 m  = 0.0036
+//   battery 0.40 kg at 0.060 = 0.0014   <- second largest
+//   battery's own inertia    = 0.0001
+//   boom, 0.20 kg at 0.050   = 0.0005
+//   ESCs, near the axis      = 0.0001
+//   electronics and wiring   = 0.0010
+//                              ------
+//                              0.0067
+//
+// Pitch and yaw are ~11x larger because the same nacelle
+// masses sit at 0.356 m instead of 0.089 m, and inertia
+// goes as r squared.
+//
+// Mass budget, closes at the measured 1.200 kg:
+//
+//   2 x nacelle  (motor+servo+mount+prop)  0.450
+//   2 x ESC      (partway out the boom)    0.060
+//   battery      (boom center, slung low)  0.400
+//   boom/frame                             0.200
+//   FC, RX, wiring                         0.090
+//                                          -----
+//                                          1.200
+//
+// This is what converts a moment into an angular
+// acceleration:  alpha = moment / inertia
 //
 // Plant sensitivity, deg/s^2 per us of PID output:
 //
 //   ROLL   (both nacelles tilt)   16.8
 //   PITCH  (differential thrust)  11.6
 //   YAW    (opposite tilt)         5.1
+//
+// TILT SCALING
+//
+// Roll and yaw sensitivity is proportional to how many
+// degrees the nacelle tilts per microsecond, so those two
+// rate Kp values scale as 1 / (deg per us). If you measure
+// the real travel, read the matching row:
+//
+//     travel            roll Kp    yaw Kp
+//     ------------------------------------
+//      60 deg/1000us      1.07      2.87
+//      90 deg/1000us      0.71      1.91   <- CONFIRMED
+//     120 deg/1000us      0.53      1.43
+//     150 deg/1000us      0.43      1.15
+//
+// Confirmed from the servo datasheet: 180 deg over a
+// 500-2500 us range is 0.09 deg/us, i.e. 90 deg per
+// 1000 us over the 1000-2000 us actually commanded.
+//
+// Angle Kp is NOT affected: it is deg/s per deg and only
+// depends on the rate-loop bandwidth, which these values
+// hold constant at 10 rad/s.
+//
+// Pitch is differential thrust and does not involve the
+// servos at all, so pitchRatePID is unaffected either way.
 //
 // Rate Kp = target bandwidth / sensitivity.
 // Pitch is capped at 8 rad/s by ~80 ms prop spin-up lag;
@@ -524,7 +604,7 @@ struct PID {
 //
 
 PID rollAnglePID = {
-  2.2f,     // kp - was 3.3, lowered after the slow sway
+  1.5f,     // kp - 3.3 -> 2.2 -> 1.5, chasing the slow sway
   0.0f,     // ki  - leave at zero, rate loop holds trim
   0.0f,     // kd
   0.0f,     // iLimit
@@ -538,15 +618,20 @@ PID rollAnglePID = {
 // ROLL RATE PID
 // ============================================================
 //
-// Least confident axis: I_roll is small and dominated by
-// the two nacelles at 3.5 in above the CG, so this is the
-// gain most likely to need adjustment. Tune roll first.
+// Least confident axis. The roll moment of inertia (see
+// the derivation block above - a mass property, not the
+// integral term) is small and dominated by the two
+// nacelles at 3.5 in above the CG, so this is the gain
+// most likely to need adjustment. Tune roll first.
 //
 
 PID rollRatePID = {
-  0.60f,    // kp
+  0.71f,    // kp - raised from 0.60. Roll inertia rose each
+            //      time real masses replaced estimates
+            //      (0.0056 -> 0.0062 -> 0.0067), so this
+            //      loop was under-gained, not over.
   0.0f,     // ki  - raise to 1.5 once hover is stable
-  0.018f,   // kd
+  0.021f,   // kd
   120.0f,   // iLimit, us
   -250.0f,  // us  (roll 250 + yaw 150 = 400 = full tilt range)
   250.0f,
@@ -579,9 +664,9 @@ PID pitchAnglePID = {
 //
 
 PID pitchRatePID = {
-  0.69f,    // kp
+  0.68f,    // kp
   0.0f,     // ki  - raise to 1.4 once hover is stable
-  0.048f,   // kd
+  0.047f,   // kd
   100.0f,   // iLimit, us
   -150.0f,  // us of differential throttle
   150.0f,
@@ -598,9 +683,9 @@ PID pitchRatePID = {
 //
 
 PID yawRatePID = {
-  1.95f,    // kp
+  1.91f,    // kp
   0.0f,     // ki  - raise to 3.0 once hover is stable
-  0.058f,   // kd
+  0.057f,   // kd
   100.0f,   // iLimit, us
   -150.0f,  // us
   150.0f,
@@ -1039,24 +1124,44 @@ void updateAttitude(
   // measuring gravity.
   //
 
-  if (accelTrusted) {
+  // ----------------------------------------------------------
+  // GYRO DISAGREEMENT GATE
+  // ----------------------------------------------------------
+
+  rollAccelOK =
+    accelTrusted
+    && fabs(accelRoll - rollAngleRaw)
+         < ACCEL_DISAGREE_LIMIT;
+
+
+  pitchAccelOK =
+    accelTrusted
+    && fabs(accelPitch - pitchAngleRaw)
+         < ACCEL_DISAGREE_LIMIT;
+
+
+  if (rollAccelOK || pitchAccelOK) {
     float alpha =
       COMPLEMENTARY_TAU
       / (COMPLEMENTARY_TAU + dt);
 
 
-    rollAngleRaw =
-      alpha
-        * rollAngleRaw
-      + (1.0f - alpha)
-          * accelRoll;
+    if (rollAccelOK) {
+      rollAngleRaw =
+        alpha
+          * rollAngleRaw
+        + (1.0f - alpha)
+            * accelRoll;
+    }
 
 
-    pitchAngleRaw =
-      alpha
-        * pitchAngleRaw
-      + (1.0f - alpha)
-          * accelPitch;
+    if (pitchAccelOK) {
+      pitchAngleRaw =
+        alpha
+          * pitchAngleRaw
+        + (1.0f - alpha)
+            * accelPitch;
+    }
   }
 
 
@@ -1879,7 +1984,8 @@ void printStatus(
 
 
   Serial.print(" ACC:");
-  Serial.print(accelTrusted ? 1 : 0);
+  Serial.print(rollAccelOK ? 1 : 0);
+  Serial.print(pitchAccelOK ? 1 : 0);
 
   Serial.print(" LOOP:");
   Serial.print(loopTimeMaxUS);
