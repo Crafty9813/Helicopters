@@ -258,13 +258,23 @@ float pitchAngleRaw = 0;
 float rollLevelOffset = 0.0f;
 float pitchLevelOffset = 0.0f;
 
-// alpha = 0.98 at 250 Hz is tau = 0.196 s, which lets
-// prop vibration and the lateral acceleration from
-// nacelle tilt leak straight into the attitude estimate.
+// Time constant of the complementary filter, in seconds.
 //
-// 0.998 gives tau = 2.0 s.
+// The old code used a fixed alpha of 0.98, which is only
+// tau = 0.196 s at 250 Hz and let prop vibration and the
+// lateral acceleration from nacelle tilt leak straight into
+// the attitude estimate.
+//
+// A fixed alpha is also wrong whenever dt varies, because
+// it silently changes the time constant with the loop rate.
+// The coefficient is now computed from the measured dt:
+//
+//     alpha = tau / (tau + dt)
+//
+// which gives 0.998 at the nominal 4 ms and stays correct
+// when a loop runs long.
 
-const float COMPLEMENTARY_ALPHA = 0.998f;
+const float COMPLEMENTARY_TAU = 2.0f;
 
 
 // ============================================================
@@ -670,6 +680,28 @@ const int DISARM_YAW_LOW = 1100;
 uint32_t lastPrintTime = 0;
 
 
+// ============================================================
+// TELEMETRY GATING
+// ============================================================
+//
+// The status line is ~200 characters. At 115200 baud that is
+// 17 ms of transmission, and with a 64 byte TX buffer
+// Serial.print BLOCKS for about 12 ms of it - three loop
+// periods at 250 Hz.
+//
+// So telemetry is printed only while throttle is below
+// MIN_FLIGHT_THROTTLE, i.e. on the ground. Advancing the
+// throttle silences the port automatically and the control
+// loop runs clean.
+//
+// loopTimeMaxUS keeps accumulating in flight and is reported
+// on the first print after you land and lower the throttle,
+// so the number you see then is the worst case of the whole
+// flight.
+
+const bool TELEMETRY_IN_FLIGHT = false;
+
+
 // Worst control-path execution time since the last print,
 // in microseconds. The budget at 250 Hz is 4000. Measured
 // before the telemetry print so it does not include the
@@ -1008,17 +1040,22 @@ void updateAttitude(
   //
 
   if (accelTrusted) {
+    float alpha =
+      COMPLEMENTARY_TAU
+      / (COMPLEMENTARY_TAU + dt);
+
+
     rollAngleRaw =
-      COMPLEMENTARY_ALPHA
+      alpha
         * rollAngleRaw
-      + (1.0f - COMPLEMENTARY_ALPHA)
+      + (1.0f - alpha)
           * accelRoll;
 
 
     pitchAngleRaw =
-      COMPLEMENTARY_ALPHA
+      alpha
         * pitchAngleRaw
-      + (1.0f - COMPLEMENTARY_ALPHA)
+      + (1.0f - alpha)
           * accelPitch;
   }
 
@@ -2391,7 +2428,12 @@ void loop() {
   // TELEMETRY
   // ==========================================================
 
-  if (millis() - lastPrintTime >= PRINT_INTERVAL) {
+  bool onGround =
+    throttleUS < MIN_FLIGHT_THROTTLE;
+
+
+  if ((onGround || TELEMETRY_IN_FLIGHT)
+      && millis() - lastPrintTime >= PRINT_INTERVAL) {
     lastPrintTime = millis();
 
     printStatus(
