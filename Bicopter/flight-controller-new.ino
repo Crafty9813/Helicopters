@@ -268,6 +268,53 @@ const float COMPLEMENTARY_ALPHA = 0.998f;
 
 
 // ============================================================
+// ACCELEROMETER TRUST GATE
+// ============================================================
+//
+// The accelerometer measures specific force, not gravity.
+// Every time the aircraft banks it accelerates sideways,
+// and the measured "down" tilts with that acceleration.
+// Blending it in then pulls the attitude estimate toward a
+// false horizon leaning the SAME way as the bank.
+//
+// On a thrust-vectoring airframe that closes a positive
+// feedback loop:
+//
+//     bank -> accelerate sideways -> horizon appears to
+//     tilt the same way -> hold the bank -> accelerate more
+//
+// It shows up as a slow sway several seconds per cycle,
+// not as a fast oscillation.
+//
+// Fix: only trust the accelerometer when its magnitude is
+// near 1 g. Outside that band the aircraft is accelerating
+// and the reading is not a horizon reference, so coast on
+// the gyro instead.
+//
+// Accelerometer is at ±2g -> 16384 LSB per g.
+
+const float ACCEL_1G_LSB = 16384.0f;
+
+const float ACCEL_TRUST_LOW = 0.80f;
+const float ACCEL_TRUST_HIGH = 1.20f;
+
+const float ACCEL_TRUST_LOW_SQ =
+  (ACCEL_TRUST_LOW * ACCEL_1G_LSB)
+  * (ACCEL_TRUST_LOW * ACCEL_1G_LSB);
+
+const float ACCEL_TRUST_HIGH_SQ =
+  (ACCEL_TRUST_HIGH * ACCEL_1G_LSB)
+  * (ACCEL_TRUST_HIGH * ACCEL_1G_LSB);
+
+
+// Exposed for telemetry: watch this in flight. If it sits
+// at 0 for long stretches the band is too tight and the
+// attitude estimate is coasting on gyro drift.
+
+bool accelTrusted = true;
+
+
+// ============================================================
 // GYRO SCALE
 // ============================================================
 //
@@ -282,8 +329,13 @@ const float GYRO_LSB_PER_DPS = 65.5f;
 //
 // Cutoff for the low-pass on the rate derivative.
 // Raw d(gyro)/dt behind two 15 in props is unusable.
+//
+// 25 Hz was a quadcopter default and far too wide for
+// this airframe: differentiating gyro noise at 25 Hz put
+// visible rapid jitter on the servos while sitting still.
+// The rate loops only need lead near 1.6 Hz.
 
-const float D_TERM_CUTOFF_HZ = 25.0f;
+const float D_TERM_CUTOFF_HZ = 12.0f;
 
 
 // ============================================================
@@ -462,7 +514,7 @@ struct PID {
 //
 
 PID rollAnglePID = {
-  3.3f,     // kp
+  2.2f,     // kp - was 3.3, lowered after the slow sway
   0.0f,     // ki  - leave at zero, rate loop holds trim
   0.0f,     // kd
   0.0f,     // iLimit
@@ -589,6 +641,24 @@ bool armed = false;
 
 const int ARM_THROTTLE_LIMIT = 1050;
 
+
+// ============================================================
+// IDLE THROTTLE GUARD
+// ============================================================
+//
+// Below this the aircraft is on the ground. Without a guard,
+// being ARMED at zero throttle still runs the mixer:
+//
+//     front = 1000 + pitchOutput
+//
+// so a few degrees of attitude error spins a 15 in prop up
+// to ~1150 us while the aircraft is sitting on the ground.
+//
+// Hover is around 1563 us, so 1100 is far below anything
+// used in flight and cannot cut control while airborne.
+
+const int MIN_FLIGHT_THROTTLE = 1100;
+
 const int ARM_YAW_HIGH = 1900;
 const int DISARM_YAW_LOW = 1100;
 
@@ -598,6 +668,14 @@ const int DISARM_YAW_LOW = 1100;
 // ============================================================
 
 uint32_t lastPrintTime = 0;
+
+
+// Worst control-path execution time since the last print,
+// in microseconds. The budget at 250 Hz is 4000. Measured
+// before the telemetry print so it does not include the
+// time spent blocking on Serial.
+
+uint16_t loopTimeMaxUS = 0;
 
 const uint32_t PRINT_INTERVAL = 500;
 
@@ -683,10 +761,18 @@ void initMPU() {
 
 
   // Digital low-pass filter
+  //
+  // 0x03 = 44 Hz, 4.8 ms delay
+  // 0x04 = 21 Hz, 8.3 ms delay
+  //
+  // The rate loops run at about 1.6 Hz bandwidth, so 44 Hz
+  // was far wider than needed and was passing noise into
+  // the D term. The extra 3.5 ms of delay costs about 2
+  // degrees of phase at 10 rad/s.
 
   writeMPU(
     0x1A,
-    0x03);
+    0x04);
 
 
   // Gyro ±500 dps
@@ -893,21 +979,48 @@ void updateAttitude(
 
 
   // ----------------------------------------------------------
-  // COMPLEMENTARY FILTER
+  // ACCELEROMETER TRUST GATE
   // ----------------------------------------------------------
 
-  rollAngleRaw =
-    COMPLEMENTARY_ALPHA
-      * rollAngleRaw
-    + (1.0f - COMPLEMENTARY_ALPHA)
-        * accelRoll;
+  float ax = (float)accX;
+  float ay = (float)accY;
+  float az = (float)accZ;
 
 
-  pitchAngleRaw =
-    COMPLEMENTARY_ALPHA
-      * pitchAngleRaw
-    + (1.0f - COMPLEMENTARY_ALPHA)
-        * accelPitch;
+  float magSq =
+    ax * ax
+    + ay * ay
+    + az * az;
+
+
+  accelTrusted =
+    magSq > ACCEL_TRUST_LOW_SQ
+    && magSq < ACCEL_TRUST_HIGH_SQ;
+
+
+  // ----------------------------------------------------------
+  // COMPLEMENTARY FILTER
+  // ----------------------------------------------------------
+  //
+  // Gyro is integrated every loop above. The accelerometer
+  // is only allowed to correct it when it is actually
+  // measuring gravity.
+  //
+
+  if (accelTrusted) {
+    rollAngleRaw =
+      COMPLEMENTARY_ALPHA
+        * rollAngleRaw
+      + (1.0f - COMPLEMENTARY_ALPHA)
+          * accelRoll;
+
+
+    pitchAngleRaw =
+      COMPLEMENTARY_ALPHA
+        * pitchAngleRaw
+      + (1.0f - COMPLEMENTARY_ALPHA)
+          * accelPitch;
+  }
 
 
   // ----------------------------------------------------------
@@ -1728,6 +1841,13 @@ void printStatus(
     1);
 
 
+  Serial.print(" ACC:");
+  Serial.print(accelTrusted ? 1 : 0);
+
+  Serial.print(" LOOP:");
+  Serial.print(loopTimeMaxUS);
+  loopTimeMaxUS = 0;
+
   Serial.print(" | GYRO R:");
   Serial.print(
     gyroX_dps,
@@ -1875,10 +1995,37 @@ void setup() {
   // INITIAL ATTITUDE
   // ----------------------------------------------------------
 
-  readMPU();
+  // A single accelerometer sample was being frozen as the
+  // definition of level. One noisy reading, or a knock at
+  // that instant, became a permanent attitude bias and the
+  // aircraft would hold a standing bank all flight.
+  //
+  // Average instead.
 
-  rollAngleRaw = getAccelRoll();
-  pitchAngleRaw = getAccelPitch();
+  const int levelSamples = 200;
+
+  float rollSum = 0.0f;
+  float pitchSum = 0.0f;
+
+
+  for (
+    int i = 0;
+    i < levelSamples;
+    i++) {
+    readMPU();
+
+    rollSum += getAccelRoll();
+    pitchSum += getAccelPitch();
+
+    delay(3);
+  }
+
+
+  rollAngleRaw =
+    rollSum / levelSamples;
+
+  pitchAngleRaw =
+    pitchSum / levelSamples;
 
   // Save this as the level reference
   rollLevelOffset = rollAngleRaw;
@@ -2142,6 +2289,26 @@ void loop() {
 
 
   // ==========================================================
+  // IDLE THROTTLE GUARD
+  // ==========================================================
+  //
+  // Armed but on the ground: hold the motors at idle and the
+  // nacelles centered, and keep the controller state clear so
+  // nothing is carried into the moment of takeoff.
+  //
+  // Angles and rates are still computed above, so telemetry
+  // stays live on the ground.
+
+  if (throttleUS < MIN_FLIGHT_THROTTLE) {
+    resetAllPID();
+
+    rollOutput = 0.0f;
+    pitchOutput = 0.0f;
+    yawOutput = 0.0f;
+  }
+
+
+  // ==========================================================
   // TILT SERVO MIXER
   // ==========================================================
   //
@@ -2205,6 +2372,20 @@ void loop() {
   writeTilts(
     frontTiltCommand,
     rearTiltCommand);
+
+
+  // ==========================================================
+  // LOOP TIME
+  // ==========================================================
+
+  uint16_t elapsedUS =
+    (uint16_t)(micros() - now);
+
+
+  if (elapsedUS > loopTimeMaxUS) {
+    loopTimeMaxUS = elapsedUS;
+  }
+
 
   // ==========================================================
   // TELEMETRY
